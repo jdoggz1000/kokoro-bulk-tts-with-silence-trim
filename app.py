@@ -2,15 +2,16 @@ import io
 import os
 import re
 import zipfile
-from typing import List, Tuple
+from typing import List, Tuple, Any
+import sys
 
 import soundfile as sf
 import streamlit as st
 from pydub import AudioSegment
 from pydub.silence import detect_leading_silence
 
-# Heavy imports guarded to app runtime
-from kokoro import KPipeline
+# Note: We intentionally avoid importing kokoro/KPipeline at module import time
+# because fugashi/MeCab dictionary environment variables must be set BEFORE import.
 
 
 def trim_tail_silence(audio_segment: AudioSegment, silence_threshold: float = -50.0, chunk_size: int = 10) -> AudioSegment:
@@ -35,6 +36,19 @@ LANGUAGE_LABELS = {
     "z": "Chinese",
 }
 
+VOICE_MAP = {
+    # Single default per language for now; easily extensible to lists later
+    "a": ["af_heart"],   # American Female
+    "b": ["bf_emma"],    # British Female
+    "j": ["jf_alpha"],   # Japanese Female
+    "e": ["ef_dora"],    # Spanish Female
+    "f": ["ff_siwis"],   # French Female
+    "h": ["hf_alpha"],   # Hindi Female
+    "i": ["if_sara"],    # Italian Female
+    "p": ["pf_dora"],    # Portuguese Female
+    "z": ["zf_xiaobei"], # Chinese Female
+}
+
 
 def _sanitize_filename(name: str) -> str:
     base = re.sub(r"[^A-Za-z0-9._-]", "_", name.strip())
@@ -44,41 +58,71 @@ def _sanitize_filename(name: str) -> str:
 
 
 @st.cache_resource(show_spinner=False)
-def get_pipeline(lang_code: str) -> KPipeline:
-    # 1) Normal init
-    try:
-        return KPipeline(lang_code=lang_code)
-    except Exception as first_err:
-        # 2) If Japanese, try unidic-lite (no network, bundled dict)
-        if lang_code == "j":
-            try:
-                import unidic_lite  # type: ignore
+def get_pipeline(lang_code: str, dict_mode: str = "auto") -> Any:
+    """Initialize Kokoro pipeline, setting MeCab dictionary paths BEFORE import.
 
-                # Ensure unidic-lite is installed and discoverable
-                if hasattr(unidic_lite, "install"):
-                    unidic_lite.install()
-                # Hint fugashi to use unidic-lite dictionary
-                if hasattr(unidic_lite, "DICDIR"):
-                    os.environ["FUGASHI_DIC_DIR"] = getattr(unidic_lite, "DICDIR")
-                return KPipeline(lang_code=lang_code)
-            except Exception:
-                # 3) Fallback to full unidic download if lite is unavailable
-                try:
+    For Japanese, prefer full unidic first (downloads if needed), then fallback to unidic-lite.
+    """
+    if lang_code == "j":
+        last_err: Exception | None = None
+        # Order tries based on dict_mode
+        modes: list[str]
+        if dict_mode == "lite":
+            modes = ["lite"]
+        elif dict_mode == "unidic":
+            modes = ["unidic"]
+        else:
+            modes = ["lite", "unidic"]  # auto: prefer lite for reliability
+
+        for mode in modes:
+            try:
+                if mode == "lite":
+                    import unidic_lite  # type: ignore
+
+                    if hasattr(unidic_lite, "install"):
+                        unidic_lite.install()
+                    if hasattr(unidic_lite, "DICDIR"):
+                        os.environ["FUGASHI_DIC_DIR"] = getattr(unidic_lite, "DICDIR")
+                else:  # mode == "unidic"
                     import unidic  # type: ignore
 
-                    unidic.download()
-                    # Point fugashi to the installed unidic
-                    if hasattr(unidic, "DICDIR"):
+                    dicdir = None
+                    # download() may return a path
+                    if hasattr(unidic, "download"):
+                        try:
+                            ret = unidic.download()
+                            if isinstance(ret, str):
+                                dicdir = ret
+                        except Exception:
+                            pass
+                    if not dicdir and hasattr(unidic, "DICDIR"):
                         dicdir = getattr(unidic, "DICDIR")
+                    if dicdir:
                         os.environ["FUGASHI_DIC_DIR"] = dicdir
                         mecabrc = os.path.join(dicdir, "mecabrc")
                         if os.path.exists(mecabrc):
                             os.environ["MECABRC"] = mecabrc
-                    return KPipeline(lang_code=lang_code)
-                except Exception:
-                    raise first_err
-        # Non-Japanese or unrecoverable
-        raise first_err
+
+                # Ensure clean import with updated env vars
+                sys.modules.pop("fugashi", None)
+                sys.modules.pop("kokoro", None)
+                from kokoro import KPipeline  # lazy import after env set
+                return KPipeline(lang_code=lang_code)
+            except Exception as e:  # try next mode
+                last_err = e
+                continue
+
+        if last_err is not None:
+            raise last_err
+        # Fallback generic error
+        raise RuntimeError("Failed to initialize Japanese tokenizer dictionary")
+    else:
+        # Non-Japanese languages don't need MeCab
+        sys.modules.pop("fugashi", None)
+        sys.modules.pop("kokoro", None)
+        from kokoro import KPipeline  # lazy import at use time
+
+        return KPipeline(lang_code=lang_code)
 
 
 def parse_rows(text_area_value: str) -> List[Tuple[str, str]]:
@@ -104,7 +148,7 @@ def parse_rows(text_area_value: str) -> List[Tuple[str, str]]:
     return finalized
 
 
-def synthesize_to_wav_bytes(pipeline: KPipeline, text: str, voice: str, speed: float) -> bytes:
+def synthesize_to_wav_bytes(pipeline: Any, text: str, voice: str, speed: float) -> bytes:
     generator = pipeline(text, voice=voice, speed=speed, split_pattern=r"\n+")
     for _i, (_gs, _ps, audio) in enumerate(generator):
         buf = io.BytesIO()
@@ -134,10 +178,17 @@ with st.sidebar:
         format_func=lambda c: f"{LANGUAGE_LABELS.get(c, c)} ({c})",
         index=list(LANGUAGE_LABELS.keys()).index("j") if "j" in LANGUAGE_LABELS else 0,
     )
-    voice = st.text_input(
+    dict_mode = st.selectbox(
+        "Dictionary mode (JP)",
+        options=["lite", "unidic", "auto"],
+        index=0,
+        help="Japanese tokenizer dictionary. 'lite' is most reliable in hosted envs; 'unidic' may require a download and MECABRC.",
+    )
+    voice = st.selectbox(
         "Voice ID",
-        value="af_heart",
-        help="Enter a valid Kokoro voice ID (e.g., af_heart).",
+        options=VOICE_MAP.get(lang_code, ["af_heart"]),
+        index=0,
+        help="Select a Kokoro voice appropriate for the chosen language.",
     )
     speed = st.slider("Speed", min_value=0.5, max_value=1.5, value=1.0, step=0.05)
 
@@ -184,14 +235,14 @@ else:
             st.error(f"Failed to read CSV: {e}")
 
 if rows:
-    st.dataframe({"text": [t for t, _ in rows], "filename": [f for _, f in rows]}, use_container_width=True, hide_index=True)
+    st.dataframe({"text": [t for t, _ in rows], "filename": [f for _, f in rows]}, width="stretch", hide_index=True)
 
 col1, col2 = st.columns([1, 2])
 with col1:
     gen_btn = st.button(
         f"Generate {len(rows)} files" if rows else "Generate",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         disabled=not rows,
     )
 with col2:
@@ -199,7 +250,7 @@ with col2:
 
 if gen_btn and rows:
     try:
-        pipe = get_pipeline(lang_code)
+        pipe = get_pipeline(lang_code, dict_mode)
     except Exception as e:
         st.error(f"Failed to initialize pipeline: {e}")
         st.stop()
@@ -235,5 +286,5 @@ if gen_btn and rows:
         data=zip_bytes,
         file_name="kokoro_tts_batch.zip",
         mime="application/zip",
-        use_container_width=True,
+        width="stretch",
     )
