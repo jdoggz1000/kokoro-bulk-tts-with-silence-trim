@@ -5,4 +5,5 @@ pydub
 audioop-lts
 misaki[ja]
 misaki[zh]
-unidic
+fugashi
+unidic-lite

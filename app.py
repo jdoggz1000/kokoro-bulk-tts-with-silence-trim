@@ -1,4 +1,5 @@
 import io
+import os
 import re
 import zipfile
 from typing import List, Tuple
@@ -44,19 +45,40 @@ def _sanitize_filename(name: str) -> str:
 
 @st.cache_resource(show_spinner=False)
 def get_pipeline(lang_code: str) -> KPipeline:
+    # 1) Normal init
     try:
         return KPipeline(lang_code=lang_code)
-    except Exception as e:
-        # Attempt to auto-install Japanese dictionary if needed
+    except Exception as first_err:
+        # 2) If Japanese, try unidic-lite (no network, bundled dict)
         if lang_code == "j":
             try:
-                import unidic  # type: ignore
+                import unidic_lite  # type: ignore
 
-                unidic.download()
+                # Ensure unidic-lite is installed and discoverable
+                if hasattr(unidic_lite, "install"):
+                    unidic_lite.install()
+                # Hint fugashi to use unidic-lite dictionary
+                if hasattr(unidic_lite, "DICDIR"):
+                    os.environ["FUGASHI_DIC_DIR"] = getattr(unidic_lite, "DICDIR")
                 return KPipeline(lang_code=lang_code)
             except Exception:
-                raise e
-        raise e
+                # 3) Fallback to full unidic download if lite is unavailable
+                try:
+                    import unidic  # type: ignore
+
+                    unidic.download()
+                    # Point fugashi to the installed unidic
+                    if hasattr(unidic, "DICDIR"):
+                        dicdir = getattr(unidic, "DICDIR")
+                        os.environ["FUGASHI_DIC_DIR"] = dicdir
+                        mecabrc = os.path.join(dicdir, "mecabrc")
+                        if os.path.exists(mecabrc):
+                            os.environ["MECABRC"] = mecabrc
+                    return KPipeline(lang_code=lang_code)
+                except Exception:
+                    raise first_err
+        # Non-Japanese or unrecoverable
+        raise first_err
 
 
 def parse_rows(text_area_value: str) -> List[Tuple[str, str]]:
