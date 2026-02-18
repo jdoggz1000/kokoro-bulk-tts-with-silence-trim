@@ -1,0 +1,8 @@
+streamlit
+kokoro>=0.9.4
+soundfile
+pydub
+audioop-lts
+misaki[ja]
+misaki[zh]
+unidic
